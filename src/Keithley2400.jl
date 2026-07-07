@@ -8,14 +8,12 @@ function parse_commandline()
 	s = ArgParseSettings()
 
 	@add_arg_table! s begin
-		"--sleep_interupt_time"
+		"sleep_interupt_time"
 			help = "The time interval in milliseconds that the program " *
 					"sleeps for between taking samples. It might be more " *
 					"performant and accurate to set this value high but " *
 					"it also means that you can't cancel a measurement " *
 					"in less than `sleep_interupt_time` milliseconds"
-		"--measurement_average_count"
-			help = "The number of measurements taken to average over"
 	end
 	parsed_args = parse_args(s) # the result is a Dict{String,Any}
 	# println("Parsed args:")
@@ -30,6 +28,7 @@ import CImGui.CSyntax: @c, @cstatic
 import ImPlot
 
 global plotlock = ReentrantLock()
+global gpiblock = ReentrantLock()
 
 using NativeFileDialog, DelimitedFiles
 
@@ -65,9 +64,7 @@ using Instruments
 
 global uwSource::GenericInstrument = GenericInstrument()
 global keithley_initialized::Bool = false
-global avg_count::Int = 10
 
-# TODO add error handling by checking the keithley's error registers
 function initialize_keithley()
 	global uwSource
 	global keithley_initialized
@@ -97,10 +94,23 @@ function initialize_keithley()
 	write(uwSource, "*RST")
 	write(uwSource, "SOUR:FUNC VOLT")
 	write(uwSource, "SENS:FUNC 'CURR'")
-	write(uwSource, "FORM:DATA ASC")
-
+	write(uwSource, "FORM:ELEM VOLT,CURR")
 
 	keithley_initialized = true
+	return nothing
+end
+
+global event_list = String[]
+function getevents()
+	noerr = "No error"
+	@lock gpiblock begin
+		while true
+			output = query(uwSource, "STAT:QUE:NEXT?")
+			occursin(noerr, output) && break
+			@info output
+			push!(event_list, output)
+		end
+	end
 	return nothing
 end
 
@@ -127,19 +137,24 @@ function keithley_monitor(volts_set::Float64, maxcurrent::Float64)
 	global rt_times
 
 	@info "Starting Monitor with voltage set to $volts_set"
-	write(uwSource, "OUTP ON")
 	write(uwSource, "SENS:CURR:PROT $(maxcurrent)")
-
 	write(uwSource, "SOUR:VOLT $(volts_set)")
+	
+	write(uwSource, "OUTP ON")
 	monitor_is_monitoring[] = true
 	while !monitor_cancel[]
 		interuptsleep(monitor_sample_period, monitor_cancel, sleep_interupt_interval)
-		measIstr = query(uwSource, "MEAS:CURR?")
-		measI, measV = nothing, nothing
+		measIstr = nothing
+		measVstr = nothing
+		@lock gpiblock begin
+			meascurr = query(uwSource, "MEAS:CURR?")
+			measvolt = query(uwSource, "MEAS:CURR?")
+		end
 		try
-			mv,mi = split(measIstr, ',')
-			measI = parse(Float64, mi)
-			measV = parse(Float64, mv)
+			_, curr = split(meascurr, ',')
+			volt, _ = split(measvolt, ',')
+			measI = parse(Float64, measIstr)
+			measV = parse(Float64, volt)
 			@lock plotlock begin
 				push!(rt_times, now())
 				push!(rt_currs, measI)
@@ -180,9 +195,9 @@ function keithley_sweep(
 	global iv_currs
 	global iv_times
 
-	write(uwSource, "OUTP ON")
-	# write(uwSource, "SOUR:VOLT:ILIMIT $(maxcurrent)")
 	write(uwSource, "SENS:CURR:PROT $(maxcurrent)")
+	write(uwSource, "SOUR:VOLT 0")
+	write(uwSource, "OUTP ON")
 
 	empty!(iv_volts)
 	empty!(iv_currs)
@@ -208,20 +223,23 @@ function keithley_sweep(
 		iv_sweep_cancel[] && break
 		write(uwSource, "SOUR:VOLT $V")
 		interuptsleep(steptime, iv_sweep_cancel, sleep_interupt_interval)
-		measIstr = query(uwSource, "MEAS:CURR?")
-		measI, measV = nothing, nothing
+		@lock gpiblock begin
+			meascurr = query(uwSource, "MEAS:CURR?")
+			measvolt = query(uwSource, "MEAS:CURR?")
+		end
 		try
-			mv,mi = split(measIstr, ',')
-			measI = parse(Float64, mi)
-			measV = parse(Float64, mv)
+			_, curr = split(meascurr, ',')
+			volt, _ = split(measvolt, ',')
+			measI = parse(Float64, measIstr)
+			measV = parse(Float64, volt)
+			@lock plotlock begin
+				push!(iv_times, now())
+				push!(iv_currs, measI)
+				push!(iv_volts, measV)
+			end
 		catch e
 			@error e
 			continue
-		end
-		@lock plotlock begin
-			push!(iv_times, now())
-			push!(iv_currs, measI)
-			push!(iv_volts, measV)
 		end
 	end
 	iv_is_sweeping[] = false
@@ -231,11 +249,18 @@ function keithley_sweep(
 	return nothing
 end
 
+# Can be :datetime, :seconds, or :nanoseconds
+global timestamp_mode::Symbol = :seconds
+
+
+# Initialize Plot Axis Flags
+global xflags = ImPlot.ImPlotAxisFlags_None | ImPlot.ImPlotAxisFlags_AutoFit
+global yflags = ImPlot.ImPlotAxisFlags_None | ImPlot.ImPlotAxisFlags_AutoFit
+
+global WINSCALE::Float32 = 1.0
+global sidebarwidth = 100WINSCALE
+
 function (@main)(ARGS)
-
-	# Can be :datetime, :seconds, or :nanoseconds
-	timestamp_mode = :seconds
-
 	global sleep_interupt_interval
 	## Parse ARGS
 	parsed = parse_commandline()
@@ -243,11 +268,6 @@ function (@main)(ARGS)
 		sleepii = parse(Int, parsed["sleep_interupt_time"])
 		sleep_interupt_interval = millis(sleepii)
 	end
-	avg_count = 10
-	if parsed["measurement_average_count"] !== nothing
-		avg_count = parse(Int, parsed["measurement_average_count"])
-	end
-	
 
 
 	## Initialize Keithley 2470
@@ -266,9 +286,14 @@ function (@main)(ARGS)
 	style = ig.GetStyle()
 	p_ctx = ImPlot.CreateContext()
 
-	## Initialize Plot Axis Flags
-	xflags = ImPlot.ImPlotAxisFlags_None | ImPlot.ImPlotAxisFlags_AutoFit
-	yflags = ImPlot.ImPlotAxisFlags_None | ImPlot.ImPlotAxisFlags_AutoFit
+	## Add Icon fonts
+	fonts = unsafe_load(ig.GetIO().Fonts)
+	default_font = ig.AddFontDefault(fonts)
+	global fontawesome = ig.AddFontFromFileTTF(fonts, joinpath(@__DIR__,"..", "fonts", "Font Awesome 7 Free-Regular-400.otf"), 16)
+	# default_font = ig.AddFontFromFileTTF(fonts, joinpath(@__DIR__,"..", "fonts", "ProggyTiny.ttf"), 16)
+	@assert default_font != C_NULL
+	@assert fontawesome != C_NULL
+
 
 	## Start Render Loop
 	exit_application_bool = true
@@ -276,10 +301,17 @@ function (@main)(ARGS)
 	ig.render(ctx; window_size=(100,100), window_title="Keithley 2470", on_exit=() -> ImPlot.DestroyContext(p_ctx)) do
 		exit_application_bool || exit()
 
+		# ig.Begin("ImGui Style Editor")
+		# ig.ShowStyleEditor()
+		# ig.End()
+
+		global WINSCALE
+		global sidebarwidth
 		WINSCALE = ig.GetWindowDpiScale()
+		sidebarwidth = 200WINSCALE
 
 		if first_frame
-			win::GLFW.Window = ig._current_window(Val{:GlfwOpenGL3}())
+			win = ig._current_window(Val{:GlfwOpenGL3}())
 			GLFW.HideWindow(win)
 		end
 		first_frame = false
@@ -288,288 +320,17 @@ function (@main)(ARGS)
 			ig.ImGuiWindowFlags_MenuBar |
 			ig.ImGuiWindowFlags_NoCollapse )
 
-		if ig.BeginMenuBar()
-			if ig.BeginMenu("Timestamp Export Mode")
-				selected::Int32 = @match timestamp_mode begin
-					:datetime => 1
-					:seconds => 2
-					:nanoseconds => 3
-					_ => -1
-				end
 
-				@c ig.RadioButton("DateTime Timestamps", &selected, 1)
-				@c ig.RadioButton("Seconds since start of capture", &selected, 2)
-				@c ig.RadioButton("Nanoseconds since start of capture", &selected, 3)
-
-				timestamp_mode = [:datetime, :seconds, :nanoseconds][selected]
-				ig.EndMenu()
-			end
-			ig.EndMenuBar()
-		end
+		menubar()
 
 		if ig.BeginTabBar("IV and RealTime", ig.ImGuiTabBarFlags_NoCloseWithMiddleMouseButton)
-			if ig.BeginTabItem("I-V Sweep")
 
-				ig.BeginGroup()
-				global iv_is_sweeping
-				if ig.Button("Clear Data##iv", (250WINSCALE, 30WINSCALE)) && !iv_is_sweeping[]
-					ig.OpenPopup("clear_data_popup##iv")
-				end
-				if iv_is_sweeping[]
-					if ig.BeginItemTooltip()
-						ig.TextColored((255,0,0,255), "You Cannot clear data during a sweep")
-						ig.EndTooltip()
-					end
-				end
-				global iv_times
-				global iv_currs
-				global iv_volts
-				if ig.BeginPopup("clear_data_popup##iv")
-					ig.SeparatorText("Are you sure you want to erase the data?")
-					ig.SeparatorText("")
-					if ig.Button("I'm sure I want to permanently erase data.")
-						empty!(iv_times)
-						empty!(iv_currs)
-						empty!(iv_volts)
-						ig.CloseCurrentPopup()
-					end
-					ig.EndPopup()
-				end
+			ivtab()
 
-				ig.PushStyleVar(ig.lib.ImGuiStyleVar_CellPadding, (3,3))
-				if ig.BeginTable("iv_maxmin_table", 2, 0, (250WINSCALE,50WINSCALE))
-					ig.TableSetupColumn("Maximum [A]")
-					ig.TableSetupColumn("Minimum [A]")
-					ig.TableHeadersRow()
-					ig.TableNextRow()
-					ig.TableSetColumnIndex(0)
-					ig.Text("$(isempty(iv_currs) ? "NAN" : round(maximum(iv_currs), sigdigits=5))")
-					ig.TableSetColumnIndex(1)
-					ig.Text("$(isempty(iv_currs) ? "NAN" : round(minimum(iv_currs), sigdigits=5))")
-					ig.EndTable()
-				end
-				ig.PopStyleVar()
-
-				global iv_is_sweeping
-				if ig.Button("Save Data##iv", (250WINSCALE, 30WINSCALE)) && !iv_is_sweeping[]
-					filepath = save_file(;filterlist="csv")
-					!isempty(filepath) && savetofile(iv_times, iv_currs, iv_volts, timestamp_mode, filepath)
-				end
-				if iv_is_sweeping[]
-					if ig.BeginItemTooltip()
-						ig.TextColored((255,0,0,255), "You cannot save data during a sweep")
-						ig.EndTooltip()
-					end
-				end
-
-				ig.PushItemWidth(90WINSCALE)
-				@cstatic iv_min_volts=Cdouble(-1) iv_max_volts=Cdouble(1) iv_step_voltage=Cdouble(0.1) iv_sweep_time=Cdouble(0) iv_init_voltage=Cdouble(0) maxcurrent=Cdouble(0.1) iv_sweep_dir=Int32(1) begin
-				
-				@c ig.InputDouble("Minimum Voltage [V]", &iv_min_volts)
-				@c ig.InputDouble("Maximum Voltage [V]", &iv_max_volts)
-				@c ig.InputDouble("Step Voltage [V]", &iv_step_voltage)
-				if iv_step_voltage < 0 iv_step_voltage = 0 end
-				@c ig.InputDouble("Sweep time [s]", &iv_sweep_time)
-				if iv_sweep_time < 0 iv_sweep_time = 0 end
-				
-				@c ig.InputDouble("Initial Voltage [V]", &iv_init_voltage)
-				@c ig.InputDouble("Max Current [A]", &maxcurrent)
-				ig.PopItemWidth()
-				
-				ig.SetNextItemWidth(170WINSCALE)
-				@c ig.Combo("Start Sweep##combo", &iv_sweep_dir, ["Towards Positive", "Towards Negative"])
-
-				global monitor_is_monitoring
-				global iv_is_sweeping
-				global iv_sweep_cancel
-				if !iv_is_sweeping[] && ig.Button("Start Sweep", (250WINSCALE, 30WINSCALE)) && !monitor_is_monitoring[]
-					ig.OpenPopup("start_sweep_popup")
-				end
-				if monitor_is_monitoring[]
-					if ig.BeginItemTooltip()
-						ig.TextColored((255,0,0,255), "You Cannot start a sweep while monitoring")
-						ig.EndTooltip()
-					end
-				end
-				if ig.BeginPopup("start_sweep_popup")
-					ig.SeparatorText("Are you sure you want to start a sweep?")
-					ig.SeparatorText("Starting a sweep will erase the previous sweep from memory.")
-					if ig.Button("I'm sure I want to permanently erase data and start a new sweep.")
-						iv_sweep_cancel[] = false
-						errormonitor(
-							Threads.@spawn keithley_sweep(
-								iv_min_volts, iv_max_volts,
-								iv_step_voltage, iv_init_voltage,
-								iv_sweep_dir, maxcurrent, seconds(iv_sweep_time))
-						)
-						ig.CloseCurrentPopup()
-					end
-					ig.EndPopup()
-				end
-				global iv_sweep_cancel
-				if iv_is_sweeping[] && ig.Button("Cancel Sweep##iv_sweep", (250WINSCALE, 30WINSCALE))
-					iv_sweep_cancel[] = true
-				end
-				end #= @cstatic iv_min_volts=Cdouble(-1) iv_max_volts=Cdouble(1) iv_sweep_time=Cdouble(0) iv_init_voltage=Cdouble(0) maxcurrent=Cdouble(1) iv_sweep_dir=Int32(1) begin =#
-
-
-				ig.EndGroup()
-				
-				ig.SameLine()
-
-				ig.BeginGroup()
-				@c ig.CheckboxFlags("Fit X-Axis", &xflags, ImPlot.ImPlotAxisFlags_AutoFit)
-				ig.SameLine()
-				@c ig.CheckboxFlags("Fit Y-Axis", &yflags, ImPlot.ImPlotAxisFlags_AutoFit)
-				if (xflags | yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
-					if (xflags & yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
-						xflags = xflags & ~ImPlot.ImPlotAxisFlags_RangeFit
-						yflags = yflags & ~ImPlot.ImPlotAxisFlags_RangeFit
-					else
-						ig.SameLine()
-						if xflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
-							@c ig.CheckboxFlags("Range Fit", &xflags, ImPlot.ImPlotAxisFlags_RangeFit)
-						elseif yflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
-							@c ig.CheckboxFlags("Range Fit", &yflags, ImPlot.ImPlotAxisFlags_RangeFit)
-						end
-					end
-				end
-
-				if ImPlot.BeginPlot("I-V Sweep", "Voltage [V]", "Current [A]", ig.ImVec2(-1,-1))
-					ImPlot.SetupAxes("Voltage [V]", "Current [A]", xflags, yflags)
-					if !isempty(iv_currs)
-						@lock plotlock begin
-							ImPlot.PlotLine("data", iv_volts, iv_currs)
-						end
-					end
-					ImPlot.EndPlot()
-				end
-				
-				ig.EndGroup()
-
-				ig.EndTabItem()
-			end
-			if ig.BeginTabItem("Realtime Monitor")
-
-				ig.BeginGroup()
-				global monitor_is_monitoring
-				if ig.Button("Clear Data##rt", (250WINSCALE, 30WINSCALE))
-					ig.OpenPopup("clear_data_popup##rt")
-				end
-				global rt_times
-				global rt_currs
-				global rt_volts
-				if ig.BeginPopup("clear_data_popup##rt")
-					ig.SeparatorText("Are you sure you want to erase the data?")
-					ig.SeparatorText("")
-					if ig.Button("I'm sure I want to permanently erase data.")
-						empty!(rt_times)
-						empty!(rt_currs)
-						empty!(rt_volts)
-						ig.CloseCurrentPopup()
-					end
-					ig.EndPopup()
-				end
-
-				ig.PushStyleVar(ig.lib.ImGuiStyleVar_CellPadding, (3,3))
-				if ig.BeginTable("iv_maxmin_table", 3, 0, (250WINSCALE,50WINSCALE))
-					ig.TableSetupColumn("Maximum [A]")
-					ig.TableSetupColumn("Minimum [A]")
-					ig.TableSetupColumn("Average [A]")
-					ig.TableHeadersRow()
-					ig.TableNextRow()
-					ig.TableSetColumnIndex(0)
-					ig.Text("$(isempty(rt_currs) ? "NAN" : round(maximum(rt_currs), sigdigits=5))")
-					ig.TableSetColumnIndex(1)
-					ig.Text("$(isempty(rt_currs) ? "NAN" : round(minimum(rt_currs), sigdigits=5))")
-					ig.TableSetColumnIndex(2)
-					ig.Text("$(isempty(rt_currs) ? "NAN" : round(sum(rt_currs)/length(rt_currs), sigdigits=5))")
-					ig.EndTable()
-				end
-				ig.PopStyleVar()
-
-				global monitor_is_monitoring
-				if ig.Button("Save Data##rt", (250WINSCALE, 30WINSCALE))
-					filepath = save_file(;filterlist="csv")
-					!isempty(filepath) && savetofile(rt_times, rt_currs, rt_volts, timestamp_mode, filepath)
-				end
-
-				ig.PushItemWidth(90WINSCALE)
-				@cstatic set_volts=Cdouble(1) samplerate=Cdouble(0.001) maxcurrent=Cdouble(0.1) begin
-				
-				@c ig.InputDouble("Set Voltage [V]", &set_volts)
-				@c ig.InputDouble("Sample rate [s]", &samplerate)
-				if samplerate < 0 samplerate = 0 end
-				global monitor_sample_period
-				monitor_sample_period = seconds(samplerate)
-
-				@c ig.InputDouble("Max Current [A]", &maxcurrent)
-				ig.PopItemWidth()
-
-				global monitor_is_monitoring
-				global monitor_cancel
-				global iv_is_sweeping
-				if !monitor_is_monitoring[]
-					if !isempty(rt_times)
-						if ig.Button("Resume", (250WINSCALE, 40WINSCALE)) && !iv_is_sweeping[]
-							monitor_cancel[] = false
-							errormonitor(Threads.@spawn keithley_monitor(set_volts, maxcurrent))
-						end
-					elseif ig.Button("Start", (250WINSCALE, 40WINSCALE)) && !iv_is_sweeping[]
-						monitor_cancel[] = false
-						errormonitor(Threads.@spawn keithley_monitor(set_volts, maxcurrent))
-					end
-				else
-					if ig.Button("Stop", (250WINSCALE, 40WINSCALE))
-						monitor_cancel[] = true
-					end
-				end
-
-				end #= @cstatic set_volts=Cdouble(1) samplerate=Cdouble(0.001) maxcurrent=Cdouble(0.1) begin =#
-
-
-				ig.EndGroup()
-
-				ig.SameLine()
-
-				ig.BeginGroup()
-				@c ig.CheckboxFlags("Fit X-Axis", &xflags, ImPlot.ImPlotAxisFlags_AutoFit)
-				ig.SameLine()
-				@c ig.CheckboxFlags("Fit Y-Axis", &yflags, ImPlot.ImPlotAxisFlags_AutoFit)
-				if (xflags | yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
-					if (xflags & yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
-						xflags = xflags & ~ImPlot.ImPlotAxisFlags_RangeFit
-						yflags = yflags & ~ImPlot.ImPlotAxisFlags_RangeFit
-					else
-						ig.SameLine()
-						if xflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
-							@c ig.CheckboxFlags("Range Fit", &xflags, ImPlot.ImPlotAxisFlags_RangeFit)
-						elseif yflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
-							@c ig.CheckboxFlags("Range Fit", &yflags, ImPlot.ImPlotAxisFlags_RangeFit)
-						end
-					end
-				end
-				if ImPlot.BeginPlot("Realtime Monitor", "Time [ns]", "Current [A]", ig.ImVec2(-1, -1))
-					ImPlot.SetupAxes("Time [s]", "Current [A]", xflags, yflags)
-					if !isempty(rt_currs)
-						@lock plotlock begin
-							F = first(rt_times)
-							xs = rt_times .|> x->(x.ns-F.ns)/1e9
-							ImPlot.PlotLine("data", xs, rt_currs)
-						end
-					end
-					ImPlot.EndPlot()
-				end
-
-				ig.EndGroup()
-
-				ig.EndTabItem()
-			end
+			rttab()
 
 			ig.EndTabBar()
 		end
-
-
 		ig.End()
 	end
 
@@ -579,4 +340,358 @@ function (@main)(ARGS)
 end
 
 
-end # module Keithley2400
+function draw_str_list(name, list, master)
+	global sidebarwidth
+	global WINSCALE
+	tableflags = ig.ImGuiTableFlags_Borders |
+		ig.ImGuiTableFlags_RowBg |
+		ig.ImGuiTableFlags_SizingFixedFit
+	if ig.BeginTable(name, 2, tableflags, (sidebarwidth, -1f0))
+		ig.TableSetupColumn("msg", ig.ImGuiTableColumnFlags_WidthStretch)
+		ig.TableSetupColumn("delete", ig.ImGuiTableColumnFlags_WidthFixed, 30f0)
+		for (i,msg) in list
+			ig.TableNextRow()
+			ig.TableSetColumnIndex(0)
+			colw = ig.GetColumnWidth(0)
+			ig.PushTextWrapPos(ig.GetCursorPosX() + colw)
+			ig.Text(msg)
+			ig.PopTextWrapPos()
+
+			ig.TableSetColumnIndex(1)
+			ig.PushFont(fontawesome, 12)
+			if ig.Button("##listbtn$i")
+				popat!(master, i)
+			end
+			ig.PopFont()
+			
+		end
+		ig.EndTable()
+	end
+end
+
+function logs()
+	ig.BeginGroup()
+
+	if ig.Button("Get Events")
+		errormonitor(Threads.@spawn getevents())
+	end
+
+	draw_str_list("Event Log", event_list, event_list)
+	ig.EndGroup()
+end
+
+function menubar()
+	if ig.BeginMenuBar()
+		if ig.BeginMenu("Timestamp Export Mode")
+			global timestamp_mode
+			selected::Int32 = @match timestamp_mode begin
+				:datetime => 1
+				:seconds => 2
+				:nanoseconds => 3
+				_ => -1
+			end
+
+			@c ig.RadioButton("DateTime Timestamps", &selected, 1)
+			@c ig.RadioButton("Seconds since start of capture", &selected, 2)
+			@c ig.RadioButton("Nanoseconds since start of capture", &selected, 3)
+
+			global timestamp_mode
+			timestamp_mode = [:datetime, :seconds, :nanoseconds][selected]
+			ig.EndMenu()
+		end
+		ig.EndMenuBar()
+	end
+end
+
+function ivtab()
+	if ig.BeginTabItem("I-V Sweep")
+
+		ivinputs()
+		
+		ig.SameLine()
+
+		ig.BeginGroup()
+		flagschecks()
+
+		global WINSCALE
+		global sidebarwidth
+		if ImPlot.BeginPlot("I-V Sweep", "Voltage [V]", "Current [A]", ig.ImVec2(-sidebarwidth,-1))
+			global xflags
+			global yflags
+			ImPlot.SetupAxes("Voltage [V]", "Current [A]", xflags, yflags)
+			if !isempty(iv_currs)
+				@lock plotlock begin
+					lssize = length(iv_currs)
+					ImPlot.PlotLine("data", iv_volts[1:lssize], iv_currs)
+				end
+			end
+			ImPlot.EndPlot()
+		end
+		
+		ig.EndGroup()
+		
+		ig.SameLine()
+
+		logs()
+
+		ig.EndTabItem()
+	end
+end
+
+function ivinputs()
+	ig.BeginGroup()
+	global iv_is_sweeping
+	global WINSCALE
+	if ig.Button("Clear Data##iv", (250WINSCALE, 30WINSCALE)) && !iv_is_sweeping[]
+		ig.OpenPopup("clear_data_popup##iv")
+	end
+	if iv_is_sweeping[]
+		if ig.BeginItemTooltip()
+			ig.TextColored((255,0,0,255), "You Cannot clear data during a sweep")
+			ig.EndTooltip()
+		end
+	end
+	global iv_times
+	global iv_currs
+	global iv_volts
+	if ig.BeginPopup("clear_data_popup##iv")
+		ig.SeparatorText("Are you sure you want to erase the data?")
+		ig.SeparatorText("")
+		if ig.Button("I'm sure I want to permanently erase data.")
+			empty!(iv_times)
+			empty!(iv_currs)
+			empty!(iv_volts)
+			ig.CloseCurrentPopup()
+		end
+		ig.EndPopup()
+	end
+
+	ig.PushStyleVar(ig.lib.ImGuiStyleVar_CellPadding, (3,3))
+	global WINSCALE
+	if ig.BeginTable("iv_maxmin_table", 2, 0, (250WINSCALE,50WINSCALE))
+		ig.TableSetupColumn("Maximum [A]")
+		ig.TableSetupColumn("Minimum [A]")
+		ig.TableHeadersRow()
+		ig.TableNextRow()
+		ig.TableSetColumnIndex(0)
+		ig.Text("$(isempty(iv_currs) ? "NAN" : round(maximum(iv_currs), sigdigits=5))")
+		ig.TableSetColumnIndex(1)
+		ig.Text("$(isempty(iv_currs) ? "NAN" : round(minimum(iv_currs), sigdigits=5))")
+		ig.EndTable()
+	end
+	ig.PopStyleVar()
+
+	global iv_is_sweeping
+	global timestamp_mode
+	global WINSCALE
+	if ig.Button("Save Data##iv", (250WINSCALE, 30WINSCALE)) && !iv_is_sweeping[]
+		filepath = save_file(;filterlist="csv")
+		!isempty(filepath) && savetofile(iv_times, iv_currs, iv_volts, timestamp_mode, filepath)
+	end
+	if iv_is_sweeping[]
+		if ig.BeginItemTooltip()
+			ig.TextColored((255,0,0,255), "You cannot save data during a sweep")
+			ig.EndTooltip()
+		end
+	end
+
+	global WINSCALE
+	ig.PushItemWidth(90WINSCALE)
+	@cstatic iv_min_volts=Cdouble(-1) iv_max_volts=Cdouble(1) iv_step_voltage=Cdouble(0.1) iv_delay=Cdouble(0) maxcurrent=Cdouble(0.1) dual=true begin
+	
+	@c ig.InputDouble("Minimum Voltage [V]", &iv_min_volts)
+	@c ig.InputDouble("Maximum Voltage [V]", &iv_max_volts)
+	@c ig.InputDouble("Step Voltage [V]", &iv_step_voltage)
+	if iv_step_voltage < 0 iv_step_voltage = 0 end
+	@c ig.InputDouble("Delay [s]", &iv_delay)
+	if iv_delay < 0 iv_delay = 0 end
+
+	@c ig.Checkbox("Sweep back and forth", &dual)
+	
+	@c ig.InputDouble("Max Current [A]", &maxcurrent)
+	ig.PopItemWidth()
+
+	global monitor_is_monitoring
+	global iv_is_sweeping
+	global iv_sweep_cancel
+	global WINSCALE
+	if !iv_is_sweeping[] && ig.Button("Start Sweep", (250WINSCALE, 30WINSCALE)) && !monitor_is_monitoring[]
+		ig.OpenPopup("start_sweep_popup")
+	end
+	if monitor_is_monitoring[]
+		if ig.BeginItemTooltip()
+			ig.TextColored((255,0,0,255), "You Cannot start a sweep while monitoring")
+			ig.EndTooltip()
+		end
+	end
+	if ig.BeginPopup("start_sweep_popup")
+		ig.SeparatorText("Are you sure you want to start a sweep?")
+		ig.SeparatorText("Starting a sweep will erase the previous sweep from memory.")
+		if ig.Button("I'm sure I want to permanently erase data and start a new sweep.")
+			iv_sweep_cancel[] = false
+			getevents()
+			errormonitor(
+				Threads.@spawn lin_step_sweep(
+					iv_min_volts, iv_max_volts,
+					iv_step_voltage, iv_delay,
+					dual, maxcurrent)
+			)
+			ig.CloseCurrentPopup()
+		end
+		ig.EndPopup()
+	end
+	global iv_sweep_cancel
+	global WINSCALE
+	if iv_is_sweeping[] && ig.Button("Cancel Sweep##iv_sweep", (250WINSCALE, 30WINSCALE))
+		iv_sweep_cancel[] = true
+	end
+	end #= @cstatic iv_min_volts=Cdouble(-1) iv_max_volts=Cdouble(1) iv_sweep_time=Cdouble(0) iv_init_voltage=Cdouble(0) maxcurrent=Cdouble(1) iv_sweep_dir=Int32(1) begin =#
+
+	ig.Text("$(length(iv_currs)) data points so far")
+
+	ig.EndGroup()
+	
+end
+
+function flagschecks()
+	global xflags
+	global yflags
+	@c ig.CheckboxFlags("Fit X-Axis", &xflags, ImPlot.ImPlotAxisFlags_AutoFit)
+	ig.SameLine()
+	@c ig.CheckboxFlags("Fit Y-Axis", &yflags, ImPlot.ImPlotAxisFlags_AutoFit)
+	if (xflags | yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
+		if (xflags & yflags) & ImPlot.ImPlotAxisFlags_AutoFit != 0
+			xflags = xflags & ~ImPlot.ImPlotAxisFlags_RangeFit
+			yflags = yflags & ~ImPlot.ImPlotAxisFlags_RangeFit
+		else
+			ig.SameLine()
+			if xflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
+				@c ig.CheckboxFlags("Range Fit", &xflags, ImPlot.ImPlotAxisFlags_RangeFit)
+			elseif yflags & ImPlot.ImPlotAxisFlags_AutoFit != 0
+				@c ig.CheckboxFlags("Range Fit", &yflags, ImPlot.ImPlotAxisFlags_RangeFit)
+			end
+		end
+	end
+end
+
+function rttab()
+	if ig.BeginTabItem("Realtime Monitor")
+
+		rtinputs()
+		ig.SameLine()
+
+		ig.BeginGroup()
+		flagschecks()
+		if ImPlot.BeginPlot("Realtime Monitor", "Time [ns]", "Current [A]", ig.ImVec2(-sidebarwidth,-1))
+			global xflags
+			global yflags
+			ImPlot.SetupAxes("Time [s]", "Current [A]", xflags, yflags)
+			if !isempty(rt_currs)
+				@lock plotlock begin
+					F = first(rt_times)
+					xs = rt_times .|> x->(x.ns-F.ns)/1e9
+					ImPlot.PlotLine("data", xs, rt_currs)
+				end
+			end
+			ImPlot.EndPlot()
+		end
+
+		ig.EndGroup()
+		
+		ig.SameLine()
+
+		logs()
+
+		ig.EndTabItem()
+	end
+end
+
+function rtinputs()
+	ig.BeginGroup()
+	global monitor_is_monitoring
+	global WINSCALE
+	if ig.Button("Clear Data##rt", (250WINSCALE, 30WINSCALE))
+		ig.OpenPopup("clear_data_popup##rt")
+	end
+	global rt_times
+	global rt_currs
+	global rt_volts
+	if ig.BeginPopup("clear_data_popup##rt")
+		ig.SeparatorText("Are you sure you want to erase the data?")
+		ig.SeparatorText("")
+		if ig.Button("I'm sure I want to permanently erase data.")
+			empty!(rt_times)
+			empty!(rt_currs)
+			empty!(rt_volts)
+			ig.CloseCurrentPopup()
+		end
+		ig.EndPopup()
+	end
+
+	ig.PushStyleVar(ig.lib.ImGuiStyleVar_CellPadding, (3,3))
+	global WINSCALE
+	if ig.BeginTable("iv_maxmin_table", 3, 0, (250WINSCALE,50WINSCALE))
+		ig.TableSetupColumn("Maximum [A]")
+		ig.TableSetupColumn("Minimum [A]")
+		ig.TableSetupColumn("Average [A]")
+		ig.TableHeadersRow()
+		ig.TableNextRow()
+		ig.TableSetColumnIndex(0)
+		ig.Text("$(isempty(rt_currs) ? "NAN" : round(maximum(rt_currs), sigdigits=5))")
+		ig.TableSetColumnIndex(1)
+		ig.Text("$(isempty(rt_currs) ? "NAN" : round(minimum(rt_currs), sigdigits=5))")
+		ig.TableSetColumnIndex(2)
+		ig.Text("$(isempty(rt_currs) ? "NAN" : round(sum(rt_currs)/length(rt_currs), sigdigits=5))")
+		ig.EndTable()
+	end
+	ig.PopStyleVar()
+
+	global monitor_is_monitoring
+	global timestamp_mode
+	global WINSCALE
+	if ig.Button("Save Data##rt", (250WINSCALE, 30WINSCALE))
+		filepath = save_file(;filterlist="csv")
+		!isempty(filepath) && savetofile(rt_times, rt_currs, rt_volts, timestamp_mode, filepath)
+	end
+
+	ig.PushItemWidth(90WINSCALE)
+	@cstatic set_volts=Cdouble(1) samplerate=Cdouble(0.001) maxcurrent=Cdouble(0.1) begin
+	
+	@c ig.InputDouble("Set Voltage [V]", &set_volts)
+	@c ig.InputDouble("Sample rate [s]", &samplerate)
+	if samplerate < 0 samplerate = 0 end
+	global monitor_sample_period
+	monitor_sample_period = seconds(samplerate)
+
+	@c ig.InputDouble("Max Current [A]", &maxcurrent)
+	ig.PopItemWidth()
+
+	global monitor_is_monitoring
+	global monitor_cancel
+	global iv_is_sweeping
+	global WINSCALE
+	if !monitor_is_monitoring[]
+		if !isempty(rt_times)
+			if ig.Button("Resume", (250WINSCALE, 40WINSCALE)) && !iv_is_sweeping[]
+				monitor_cancel[] = false
+				errormonitor(Threads.@spawn keithley_monitor(set_volts, maxcurrent))
+			end
+		elseif ig.Button("Start", (250WINSCALE, 40WINSCALE)) && !iv_is_sweeping[]
+			monitor_cancel[] = false
+			errormonitor(Threads.@spawn keithley_monitor(set_volts, maxcurrent))
+		end
+	else
+		if ig.Button("Stop", (250WINSCALE, 40WINSCALE))
+			monitor_cancel[] = true
+		end
+	end
+
+	end #= @cstatic set_volts=Cdouble(1) samplerate=Cdouble(0.001) maxcurrent=Cdouble(0.1) begin =#
+
+
+	ig.EndGroup()
+
+end
+
+
+end # module Keithley2470
