@@ -144,8 +144,7 @@ function keithley_monitor(volts_set::Float64, maxcurrent::Float64)
 	monitor_is_monitoring[] = true
 	while !monitor_cancel[]
 		interuptsleep(monitor_sample_period, monitor_cancel, sleep_interupt_interval)
-		measIstr = nothing
-		measVstr = nothing
+		meascurr, measvolt = nothing, nothing
 		@lock gpiblock begin
 			meascurr = query(uwSource, "MEAS:CURR?")
 			measvolt = query(uwSource, "MEAS:CURR?")
@@ -153,7 +152,7 @@ function keithley_monitor(volts_set::Float64, maxcurrent::Float64)
 		try
 			_, curr = split(meascurr, ',')
 			volt, _ = split(measvolt, ',')
-			measI = parse(Float64, measIstr)
+			measI = parse(Float64, curr)
 			measV = parse(Float64, volt)
 			@lock plotlock begin
 				push!(rt_times, now())
