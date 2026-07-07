@@ -532,10 +532,10 @@ function ivinputs()
 			iv_sweep_cancel[] = false
 			getevents()
 			errormonitor(
-				Threads.@spawn lin_step_sweep(
+				Threads.@spawn keithley_sweep(
 					iv_min_volts, iv_max_volts,
-					iv_step_voltage, iv_delay,
-					dual, maxcurrent)
+					iv_step_voltage, 0.0, 1,
+					maxcurrent, Nano(0))
 			)
 			ig.CloseCurrentPopup()
 		end
