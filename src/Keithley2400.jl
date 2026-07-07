@@ -223,6 +223,7 @@ function keithley_sweep(
 		iv_sweep_cancel[] && break
 		write(uwSource, "SOUR:VOLT $V")
 		interuptsleep(steptime, iv_sweep_cancel, sleep_interupt_interval)
+		meascurr, measvolt = nothing, nothing
 		@lock gpiblock begin
 			meascurr = query(uwSource, "MEAS:CURR?")
 			measvolt = query(uwSource, "MEAS:CURR?")
