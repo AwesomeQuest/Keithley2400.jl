@@ -231,7 +231,7 @@ function keithley_sweep(
 		try
 			_, curr = split(meascurr, ',')
 			volt, _ = split(measvolt, ',')
-			measI = parse(Float64, measIstr)
+			measI = parse(Float64, curr)
 			measV = parse(Float64, volt)
 			@lock plotlock begin
 				push!(iv_times, now())
