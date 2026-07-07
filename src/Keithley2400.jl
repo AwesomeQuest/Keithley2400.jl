@@ -354,6 +354,7 @@ function draw_str_list(name, list, master)
 			ig.TableSetColumnIndex(0)
 			colw = ig.GetColumnWidth(0)
 			ig.PushTextWrapPos(ig.GetCursorPosX() + colw)
+			@show msg
 			ig.Text(msg)
 			ig.PopTextWrapPos()
 
